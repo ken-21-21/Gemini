@@ -1,0 +1,141 @@
+import { Router } from "express";
+import { db } from "../db/index.js";
+import { GoogleGenAI } from "@google/genai";
+
+export const qaRouter = Router();
+
+const MAX_QUESTION_LENGTH = 2000;
+const MAX_QUERY_TERMS = 40;
+const MAX_QUERY_TERM_LENGTH = 64;
+
+qaRouter.post("/", async (req, res, next) => {
+  const startedAt = Date.now();
+  try {
+    const { question, cardId, sourceId } = req.body;
+    if (typeof question !== "string" || !question.trim()) {
+      res.status(400).json({ data: null, error: "question is required" });
+      return;
+    }
+    const questionTrimmed = question.trim();
+    if (questionTrimmed.length > MAX_QUESTION_LENGTH) {
+      res.status(400).json({ data: null, error: `question must be under ${MAX_QUESTION_LENGTH} characters` });
+      return;
+    }
+    if (cardId !== undefined && (!Number.isInteger(cardId) || cardId <= 0)) {
+      res.status(400).json({ data: null, error: "cardId must be a positive integer" });
+      return;
+    }
+    if (sourceId !== undefined && (!Number.isInteger(sourceId) || sourceId <= 0)) {
+      res.status(400).json({ data: null, error: "sourceId must be a positive integer" });
+      return;
+    }
+
+    let context = "";
+
+    // 1. Card context if provided
+    if (cardId) {
+      const card = db.prepare(`SELECT * FROM cards WHERE id = ?`).get(cardId) as any;
+      if (card) {
+        const note = db.prepare(`SELECT * FROM notes WHERE id = ?`).get(card.note_id) as any;
+        context += `Card context:\nQuestion: ${card.question}\nAnswer: ${card.answer}\nFields: ${note?.fields}\n\n`;
+      }
+    }
+
+    // 2. FTS5 BM25 search for relevant text
+    // Strip FTS5 special characters to avoid syntax errors
+    const safeTerms = questionTrimmed
+      .replace(/[^\w\s\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]/g, " ")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, MAX_QUERY_TERMS)
+      .map((term) => term.slice(0, MAX_QUERY_TERM_LENGTH))
+      .filter(Boolean);
+
+    let contextHitCount = 0;
+    if (safeTerms.length > 0) {
+      const matchQuery = safeTerms.map((t) => `"${t}"`).join(" OR ");
+      let ftsSql = `
+        SELECT notes.fields, notes.tags, notes_fts.rank
+        FROM notes_fts
+        JOIN notes ON notes_fts.rowid = notes.id
+        WHERE notes_fts MATCH ?
+      `;
+      const ftsParams: any[] = [matchQuery];
+
+      if (sourceId) {
+        ftsSql += ` AND notes.source_id = ?`;
+        ftsParams.push(sourceId);
+      }
+      ftsSql += ` ORDER BY rank LIMIT 10`;
+
+      try {
+        const results = db.prepare(ftsSql).all(...ftsParams) as any[];
+        if (results.length > 0) {
+          contextHitCount = results.length;
+          context += `Related material:\n`;
+          for (const r of results) {
+            context += `- ${r.fields} ${r.tags ? "(Tags: " + r.tags + ")" : ""}\n`;
+          }
+        }
+      } catch (err: any) {
+        console.warn("FTS search failed:", err);
+      }
+    }
+
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error("GEMINI_API_KEY environment variable is required.");
+    }
+
+    const ai = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        }
+      }
+    });
+
+    const prompt = `You are a helpful AI assistant for a language learning app.
+Use the following context to answer the user's question. If the context is not helpful, you can use your general knowledge, but prioritize the context.
+
+Context:
+${context}
+
+User's Question:
+${questionTrimmed}`;
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    const responseStream = await ai.models.generateContentStream({
+      model: "gemini-3.5-flash",
+      contents: prompt,
+      config: {
+        maxOutputTokens: 1024,
+      }
+    });
+
+    for await (const chunk of responseStream) {
+      if (chunk.text) {
+        res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+      }
+    }
+    res.write("data: [DONE]\n\n");
+    res.end();
+    const elapsedMs = Date.now() - startedAt;
+    console.info(
+      `[qa] ok elapsedMs=${elapsedMs} cardId=${cardId ?? "none"} sourceId=${sourceId ?? "none"} terms=${safeTerms.length} ftsHits=${contextHitCount}`
+    );
+  } catch (err: any) {
+    const elapsedMs = Date.now() - startedAt;
+    console.error(`[qa] error elapsedMs=${elapsedMs}`, err);
+    if (!res.headersSent) {
+      res.status(500).json({ data: null, error: "Failed to answer question" });
+    } else if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: "Failed to answer question" })}\n\n`);
+      res.end();
+    }
+  }
+});

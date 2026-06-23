@@ -1,0 +1,6 @@
+{
+  "name": "Japanese Spaced Repetition Flashcards",
+  "description": "A high-fidelity spaced-repetition application for Japanese language acquisition with FSRS-scheduled cards, pitch accent diagrams, and real-time transcription powered by Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
